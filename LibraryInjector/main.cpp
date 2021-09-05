@@ -68,7 +68,7 @@ public:
         vm_address_t region_addr = address_ / PAGE_SIZE * PAGE_SIZE;
         vm_size_t region_size;
         mach_port_t object; // unused
-        kcheck(vm_region_64(task_, &region_addr, &region_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &info_sz, &object));
+        kcheck(vm_region_64(task_, &region_addr, &region_size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_64_t>(&info), &info_sz, &object));
         kcheck(vm_protect(task_, region_addr, region_size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY));
         kcheck(vm_write(task_, address_, reinterpret_cast<vm_offset_t>(val), val_size));
         kcheck(vm_protect(task_, region_addr, region_size, false, info.protection));
@@ -177,11 +177,11 @@ static void inject(pid_t pid, const std::string &library) {
 
 int main(int argc, char **argv) {
     if (argc != 3) {
-        std::cerr << "Usage: " << *argv << " <process path> <library to inject>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <process path> <library to inject>" << std::endl;
         std::exit(1);
     }
 
-    if (getuid() != 0) {
+    if (geteuid() != 0) {
         std::cerr << "You must run this program as root." << std::endl;
         std::exit(1);
     }
