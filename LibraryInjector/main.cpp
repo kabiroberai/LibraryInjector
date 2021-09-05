@@ -50,20 +50,17 @@ static inline void _ensureEq(const T &a, const T &b,
 }
 #define ensureEq(a, b) (_ensureEq(a, b, #a, #b, __FILE__, __LINE__, __FUNCTION__))
 
+#define kcheck(a) (ensureEq(a, KERN_SUCCESS))
+
 class TaskCursor {
 private:
-    task_t task_;
+    const task_t task_;
     std::uintptr_t address_;
 public:
     TaskCursor(task_t task, std::uintptr_t address) : task_(task), address_(address) {}
 
-    std::uintptr_t address() {
-        return address_;
-    }
-
-    void set_address(std::uintptr_t address) {
-        address_ = address;
-    }
+    const task_t &task() { return task_; }
+    std::uintptr_t &address() { return address_; }
 
     void write(const void *val, unsigned int val_size) {
         vm_region_basic_info_data_64_t info;
@@ -71,10 +68,10 @@ public:
         vm_address_t region_addr = address_ / PAGE_SIZE * PAGE_SIZE;
         vm_size_t region_size;
         mach_port_t object; // unused
-        ensureEq(vm_region_64(task_, &region_addr, &region_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &info_sz, &object), KERN_SUCCESS);
-        ensureEq(vm_protect(task_, region_addr, region_size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY), KERN_SUCCESS);
-        ensureEq(vm_write(task_, address_, reinterpret_cast<vm_offset_t>(val), val_size), KERN_SUCCESS);
-        ensureEq(vm_protect(task_, region_addr, region_size, false, info.protection), KERN_SUCCESS);
+        kcheck(vm_region_64(task_, &region_addr, &region_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &info_sz, &object));
+        kcheck(vm_protect(task_, region_addr, region_size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY));
+        kcheck(vm_write(task_, address_, reinterpret_cast<vm_offset_t>(val), val_size));
+        kcheck(vm_protect(task_, region_addr, region_size, false, info.protection));
         address_ += val_size;
     }
 
@@ -87,7 +84,7 @@ public:
     T peek() {
         T t;
         vm_size_t count;
-        ensureEq(vm_read_overwrite(task_, address_, sizeof(t), reinterpret_cast<pointer_t>(&t), &count), KERN_SUCCESS);
+        kcheck(vm_read_overwrite(task_, address_, sizeof(t), reinterpret_cast<pointer_t>(&t), &count));
         ensureEq(count, sizeof(t));
         return t;
     }
@@ -136,11 +133,11 @@ static void insert_dylib(TaskCursor &cur, const std::string &library) {
             case LC_LAZY_LOAD_DYLIB: {
                 auto load_dylib = cur.peek<dylib_command>();
                 const auto name_addr = hdr_loc + load_dylib.dylib.name.offset;
-                cur.set_address(name_addr);
+                cur.address() = name_addr;
                 auto name = cur.scan_string();
                 if (name == "/usr/lib/libSystem.B.dylib") {
                     std::cout << "Found libSystem string at " << reinterpret_cast<void *>(name_addr) << std::endl;
-                    cur.set_address(name_addr);
+                    cur.address() = name_addr;
                     cur.write(tramp_name);
                     std::cout << "Patched!" << std::endl;
                     return;
@@ -151,30 +148,30 @@ static void insert_dylib(TaskCursor &cur, const std::string &library) {
                 break;
         }
 
-        cur.set_address(hdr_loc + hdr.cmdsize);
+        cur.address() = hdr_loc + hdr.cmdsize;
     }
 }
 
 static void inject(pid_t pid, const std::string &library) {
     std::cout << "Injecting " << library << " into pid " << pid << std::endl;
     task_port_t task;
-    ensureEq(task_for_pid(mach_task_self(), pid, &task), KERN_SUCCESS);
+    kcheck(task_for_pid(mach_task_self(), pid, &task));
 
     thread_act_array_t threads;
     mach_msg_type_number_t count;
-    ensureEq(task_threads(task, &threads, &count), KERN_SUCCESS);
+    kcheck(task_threads(task, &threads, &count));
     ensureEq(count, (mach_msg_type_number_t)1);
 
     x_thread_state_t state;
     count = sizeof(state);
-    ensureEq(thread_get_state(*threads, X_THREAD_STATE, reinterpret_cast<thread_state_t>(&state), &count), KERN_SUCCESS);
+    kcheck(thread_get_state(*threads, X_THREAD_STATE, reinterpret_cast<thread_state_t>(&state), &count));
 
     // the image load address is on top of the stack
     std::uintptr_t sp = x_thread_state_get_sp(state);
     auto cur = TaskCursor(task, sp);
     auto loadAddress = cur.scan<std::uintptr_t>();
     std::cout << "Load address: " << reinterpret_cast<void *>(loadAddress) << std::endl;
-    cur.set_address(loadAddress);
+    cur.address() = loadAddress;
     insert_dylib(cur, library);
 }
 
