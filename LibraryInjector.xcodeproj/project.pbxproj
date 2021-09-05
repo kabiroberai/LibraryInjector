@@ -428,7 +428,6 @@
 				DYLIB_CURRENT_VERSION = 1;
 				EXECUTABLE_PREFIX = lib;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				REEXPORTED_LIBRARY_NAMES = System.B;
 				SKIP_INSTALL = YES;
 			};
 			name = Debug;
@@ -442,7 +441,6 @@
 				DYLIB_CURRENT_VERSION = 1;
 				EXECUTABLE_PREFIX = lib;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				REEXPORTED_LIBRARY_NAMES = System.B;
 				SKIP_INSTALL = YES;
 			};
 			name = Release;

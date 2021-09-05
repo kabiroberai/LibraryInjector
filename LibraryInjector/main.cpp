@@ -1,9 +1,6 @@
 // Based on this gist by Saagar Jha:
 // https://gist.github.com/saagarjha/a70d44951cb72f82efee3317d80ac07f
 
-// Note: as of now, the library to be injected must re-export libSystem.B.dylib.
-// this requirement should eventually be removed.
-
 #include <vector>
 #include <iostream>
 #include <filesystem>
@@ -38,8 +35,8 @@ static inline void _ensure(bool cond, const char *cond_s, const char *file, long
 }
 #define ensure(condition) (_ensure(condition, #condition, __FILE__, __LINE__, __FUNCTION__))
 
-template <typename T>
-static inline void _ensureEq(const T &a, const T &b,
+template <typename T, typename U>
+static inline void _ensureEq(const T &a, const U &b,
                              const char *a_s, const char *b_s,
                              const char *file, long line, const char *fn) {
     if (a != b) {
@@ -51,6 +48,17 @@ static inline void _ensureEq(const T &a, const T &b,
 #define ensureEq(a, b) (_ensureEq(a, b, #a, #b, __FILE__, __LINE__, __FUNCTION__))
 
 #define kcheck(a) (ensureEq(a, KERN_SUCCESS))
+
+template <uint64_t alignment, typename T>
+static constexpr inline T align(T orig) {
+    static_assert(alignment <= (1 << sizeof(T)), "alignment too large for given type");
+    static_assert(alignment && ((alignment & (alignment - 1)) == 0),
+                  "alignment must be a positive power of two");
+    return (orig + (T)alignment - 1) & ~((T)alignment - 1);
+}
+// static_assert(align<8>(15) == 16);
+// static_assert(align<8>(16) == 16);
+// static_assert(align<8>(17) == 24);
 
 class TaskCursor {
 private:
@@ -80,20 +88,41 @@ public:
         write(&val, sizeof(val));
     }
 
+    void peek(void *out, size_t size) {
+        size_t count;
+        kcheck(vm_read_overwrite(task_, address_, size, reinterpret_cast<vm_address_t>(out), &count));
+        ensureEq(count, size);
+    }
+
+    std::unique_ptr<char[]> peek(size_t size) {
+        auto ptr = std::make_unique<char[]>(size);
+        peek(ptr.get(), size);
+        return ptr;
+    }
+
+    void scan(void *out, size_t size) {
+        peek(out, size);
+        address_ += size;
+    }
+
+    std::unique_ptr<char[]> scan(size_t size) {
+        auto ptr = peek(size);
+        address_ += size;
+        return ptr;
+    }
+
     template <typename T>
     T peek() {
         T t;
-        vm_size_t count;
-        kcheck(vm_read_overwrite(task_, address_, sizeof(t), reinterpret_cast<pointer_t>(&t), &count));
-        ensureEq(count, sizeof(t));
+        peek(&t, sizeof(t));
         return t;
     }
 
     template <typename T>
     T scan() {
-        T ret = peek<T>();
-        address_ += sizeof(T);
-        return ret;
+        T t;
+        scan(&t, sizeof(t));
+        return t;
     }
 
     std::vector<std::uintptr_t> scan_string_array() {
@@ -115,41 +144,49 @@ public:
     }
 };
 
-static const char tramp_name[] = "/tmp/tramp.dylib";
-
 // the cursor should point to the desired image header
 static void insert_dylib(TaskCursor &cur, const std::string &library) {
-    auto base = cur.scan<mach_header_64>();
-    auto ncmds = base.ncmds;
-    for (unsigned i = 0; i < ncmds; i++) {
-        uintptr_t hdr_loc = cur.address();
-        auto hdr = cur.peek<load_command>();
+    auto base = cur.address();
+    auto mh = cur.scan<mach_header_64>();
+    cur.address() += mh.sizeofcmds;
 
-        switch (hdr.cmd) {
-            case LC_LOAD_DYLIB:
-            case LC_REEXPORT_DYLIB:
-            case LC_LOAD_WEAK_DYLIB:
-            case LC_LOAD_UPWARD_DYLIB:
-            case LC_LAZY_LOAD_DYLIB: {
-                auto load_dylib = cur.peek<dylib_command>();
-                const auto name_addr = hdr_loc + load_dylib.dylib.name.offset;
-                cur.address() = name_addr;
-                auto name = cur.scan_string();
-                if (name == "/usr/lib/libSystem.B.dylib") {
-                    std::cout << "Found libSystem string at " << reinterpret_cast<void *>(name_addr) << std::endl;
-                    cur.address() = name_addr;
-                    cur.write(tramp_name);
-                    std::cout << "Patched!" << std::endl;
-                    return;
-                }
-                break;
-            }
-            default:
-                break;
+    auto cmdsize = (uint32_t)align<8>(sizeof(dylib_command) + library.length() + 1);
+    std::unique_ptr mem = cur.peek(cmdsize);
+
+    bool has_space = true;
+    // TODO: Make this check smarter; the memory might be zeroed but still used somewhere (i.e. not just padding)
+    for (unsigned i = 0; i < cmdsize; i++) {
+        if (mem[i] != 0) {
+            has_space = false;
+            break;
         }
-
-        cur.address() = hdr_loc + hdr.cmdsize;
     }
+
+    if (!has_space) {
+        // use alternate mechanism, such as overwriting an existing LC?
+        ensure(false && "not enough space");
+    }
+
+    dylib_command cmd = {
+        .cmd = LC_LOAD_DYLIB,
+        .cmdsize = cmdsize,
+        .dylib = {
+            .name = {
+                .offset = sizeof(dylib_command)
+            }
+        }
+    };
+    memcpy(mem.get(), &cmd, sizeof(cmd));
+    memcpy(mem.get() + sizeof(cmd), library.c_str(), library.length());
+    cur.write(mem.get(), cmdsize);
+
+    mh.sizeofcmds += cmdsize;
+    mh.ncmds += 1;
+
+    cur.address() = base;
+    cur.write(mh);
+
+    std::cout << "Injected!" << std::endl;
 }
 
 static void inject(pid_t pid, const std::string &library) {
@@ -160,7 +197,7 @@ static void inject(pid_t pid, const std::string &library) {
     thread_act_array_t threads;
     mach_msg_type_number_t count;
     kcheck(task_threads(task, &threads, &count));
-    ensureEq(count, (mach_msg_type_number_t)1);
+    ensureEq(count, 1);
 
     x_thread_state_t state;
     count = sizeof(state);
@@ -170,7 +207,7 @@ static void inject(pid_t pid, const std::string &library) {
     std::uintptr_t sp = x_thread_state_get_sp(state);
     auto cur = TaskCursor(task, sp);
     auto loadAddress = cur.scan<std::uintptr_t>();
-    std::cout << "Load address: " << reinterpret_cast<void *>(loadAddress) << std::endl;
+    std::cout << "Found load address: " << reinterpret_cast<void *>(loadAddress) << std::endl;
     cur.address() = loadAddress;
     insert_dylib(cur, library);
 }
@@ -186,18 +223,15 @@ int main(int argc, char **argv) {
         std::exit(1);
     }
 
-    char *process = argv[1];
-    char *library = argv[2];
-
-    if (fs::exists(tramp_name)) fs::remove(tramp_name);
-    fs::copy(library, tramp_name);
+    fs::path process = argv[1];
+    fs::path library = fs::canonical(argv[2]);
 
     es_client_t *client = NULL;
     ensureEq(es_new_client(&client, ^(es_client_t *client, const es_message_t *message) {
         switch (message->event_type) {
             case ES_EVENT_TYPE_AUTH_EXEC: {
                 const char *name = message->event.exec.target->executable->path.data;
-                if (!std::strcmp(name, process)) {
+                if (fs::equivalent(name, process)) {
                     pid_t pid = audit_token_to_pid(message->process->audit_token);
                     inject(pid, library);
                 }
