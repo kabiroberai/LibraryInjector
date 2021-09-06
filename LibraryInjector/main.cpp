@@ -14,11 +14,13 @@
 #ifdef __arm64__
 #include <mach/arm/thread_state.h>
 #define x_thread_state_get_sp(state) (arm_thread_state64_get_sp(state))
+#define x_thread_state_set_sp(state, sp) (arm_thread_state64_set_sp(state, sp))
 #define X_THREAD_STATE ARM_THREAD_STATE64
 typedef arm_thread_state64_t x_thread_state_t;
 #elif __x86_64__
 #include <mach/i386/thread_state.h>
 #define x_thread_state_get_sp(state) (state.__rsp)
+#define x_thread_state_set_sp(state, sp) do { state.__rsp = sp; } while (0)
 #define X_THREAD_STATE x86_THREAD_STATE64
 typedef x86_thread_state64_t x_thread_state_t;
 #else
@@ -144,12 +146,131 @@ public:
     }
 };
 
+// Adds DYLD_INSERT_LIBRARIES= to stack envp, moves cursor to new stack base
+// Returns load address.
+//
+// This function is needed because without DYLD_INSERT_LIBRARIES or some
+// other dyld env var, dyld may use a cached launch closure and ignore
+// our new load command
+static std::uintptr_t rearrange_stack(TaskCursor &cur) {
+    /// initial stack layout (with dummy addresses):
+    /// ...
+    /// 0x0FF0 <uninitialized>
+    /// 0x0FF8 <uninitialized>
+    /// --- _dyld_start frame vvv ---
+    /// 0x1000 (cursor) load_address
+    /// 0x1008 argc
+    /// 0x1010 argv[]
+    /// 0x1018 envp[]
+    /// 0x1020 apple[]
+    /// 0x1028 strings
+    /// --- other frames below... ---
+
+    /// final stack layout (with dummy addresses, slightly simplified):
+    /// ...
+    /// 0x0FF0 <uninitialized>
+    /// --- _dyld_start frame vvv ---
+    /// 0x0FF8 (cursor) load_address
+    /// 0x1000 argc
+    /// 0x1008 argv[]     -|
+    /// 0x1010 envp[]      | - rebased
+    /// 0x1018 apple[]    -|
+    /// 0x1020 strings
+    /// 0x1028 "DYLD_INSERT_LIBRARIES="
+    /// --- other frames below... ---
+
+    std::cout << "Rearranging... SP: " << (void *)cur.address() << std::endl;
+
+    auto loadAddress = cur.scan<std::uintptr_t>();
+    auto argc = cur.scan<std::uintptr_t>();
+    auto argvAddresses = cur.scan_string_array();
+    auto envpAddresses = cur.scan_string_array();
+    auto appleAddresses = cur.scan_string_array();
+
+    // cursor is now at the strings
+
+    auto stringReader = [&](const std::uintptr_t address) {
+        auto oldAddr = cur.address();
+        cur.address() = address;
+        auto str = cur.scan_string();
+        cur.address() = oldAddr;
+        return str;
+    };
+    auto argv = std::vector<std::string>{};
+    std::transform(argvAddresses.begin(), argvAddresses.end(), std::back_inserter(argv), stringReader);
+    auto envp = std::vector<std::string>{};
+    std::transform(envpAddresses.begin(), envpAddresses.end(), std::back_inserter(envp), stringReader);
+    auto apple = std::vector<std::string>{};
+    std::transform(appleAddresses.begin(), appleAddresses.end(), std::back_inserter(apple), stringReader);
+
+    auto dyld_insert_libraries = std::find_if(envp.begin(), envp.end(), [](const auto &string) {
+        return string.starts_with("DYLD_INSERT_LIBRARIES=");
+    });
+    // if envp already has a DYLD_INSERT_LIBRARIES, no need to do anything
+    if (dyld_insert_libraries == envp.end()) {
+        auto variable = "DYLD_INSERT_LIBRARIES=";
+        envp.push_back(variable);
+    }
+
+    argvAddresses.clear();
+    envpAddresses.clear();
+    appleAddresses.clear();
+
+    auto strings = std::vector<char>{};
+
+    auto arrayGenerator = [&strings](auto &addresses, const auto &string) {
+        addresses.push_back(strings.size());
+        std::copy(string.begin(), string.end(), std::back_inserter(strings));
+        strings.push_back('\0');
+    };
+    std::for_each(argv.begin(), argv.end(), std::bind(arrayGenerator, std::ref(argvAddresses), std::placeholders::_1));
+    std::for_each(envp.begin(), envp.end(), std::bind(arrayGenerator, std::ref(envpAddresses), std::placeholders::_1));
+    std::for_each(apple.begin(), apple.end(), std::bind(arrayGenerator, std::ref(appleAddresses), std::placeholders::_1));
+
+    // it's okay if this overwrites the arguments on the stack since we've saved them
+    // locally, and intend to write rebased versions onto the stack later
+    const auto stringsTop = (cur.address() - strings.size()) / sizeof(std::uintptr_t) * sizeof(std::uintptr_t);
+    cur.address() = stringsTop;
+    cur.write(strings.data(), (unsigned int)strings.size());
+    cur.address() = stringsTop;
+
+    auto rebaser = [&](auto &&address) {
+        address += cur.address();
+    };
+    std::for_each(argvAddresses.begin(), argvAddresses.end(), rebaser);
+    std::for_each(envpAddresses.begin(), envpAddresses.end(), rebaser);
+    std::for_each(appleAddresses.begin(), appleAddresses.end(), rebaser);
+
+    auto addresses = std::vector<std::uintptr_t>{};
+    std::copy(argvAddresses.begin(), argvAddresses.end(), std::back_inserter(addresses));
+    addresses.push_back(0);
+    std::copy(envpAddresses.begin(), envpAddresses.end(), std::back_inserter(addresses));
+    addresses.push_back(0);
+    std::copy(appleAddresses.begin(), appleAddresses.end(), std::back_inserter(addresses));
+    addresses.push_back(0);
+
+    const auto stackTop = cur.address() - (addresses.size() + 2) * sizeof(std::uintptr_t);
+    cur.address() = stackTop;
+    cur.write(loadAddress);
+    cur.write(argc);
+    cur.write(addresses.data(), (unsigned int)addresses.size() * sizeof(std::uintptr_t));
+    cur.address() = stackTop;
+
+    std::cout << "Rearranged! SP: " << (void *)stackTop << std::endl;
+
+    return loadAddress;
+}
+
 // the cursor should point to the desired image header
 static void insert_dylib(TaskCursor &cur, const std::string &library) {
-    auto base = cur.address();
+    const auto base = cur.address();
+
+    std::cout << "Inserting... MH: " << (void *)base << std::endl;
+
     auto mh = cur.scan<mach_header_64>();
     cur.address() += mh.sizeofcmds;
 
+    // +1 to NUL-terminate library
     auto cmdsize = (uint32_t)align<8>(sizeof(dylib_command) + library.length() + 1);
     std::unique_ptr mem = cur.peek(cmdsize);
 
@@ -186,11 +307,13 @@ static void insert_dylib(TaskCursor &cur, const std::string &library) {
     cur.address() = base;
     cur.write(mh);
 
-    std::cout << "Injected!" << std::endl;
+    std::cout << "Inserted!" << std::endl;
 }
 
 static void inject(pid_t pid, const std::string &library) {
-    std::cout << "Injecting " << library << " into pid " << pid << std::endl;
+    std::string libname = fs::path(library).filename().string();
+    std::cout << "Injecting " << libname << " into pid " << pid << std::endl;
+
     task_port_t task;
     kcheck(task_for_pid(mach_task_self(), pid, &task));
 
@@ -201,15 +324,20 @@ static void inject(pid_t pid, const std::string &library) {
 
     x_thread_state_t state;
     count = sizeof(state);
-    kcheck(thread_get_state(*threads, X_THREAD_STATE, reinterpret_cast<thread_state_t>(&state), &count));
+    kcheck(thread_get_state(threads[0], X_THREAD_STATE, reinterpret_cast<thread_state_t>(&state), &count));
+    kcheck(thread_convert_thread_state(threads[0], THREAD_CONVERT_THREAD_STATE_TO_SELF, X_THREAD_STATE, reinterpret_cast<thread_state_t>(&state), count, reinterpret_cast<thread_state_t>(&state), &count));
 
-    // the image load address is on top of the stack
-    std::uintptr_t sp = x_thread_state_get_sp(state);
-    auto cur = TaskCursor(task, sp);
-    auto loadAddress = cur.scan<std::uintptr_t>();
-    std::cout << "Found load address: " << reinterpret_cast<void *>(loadAddress) << std::endl;
-    cur.address() = loadAddress;
+    auto cur = TaskCursor(task, x_thread_state_get_sp(state));
+    const auto load_addr = rearrange_stack(cur);
+    x_thread_state_set_sp(state, cur.address());
+    cur.address() = load_addr;
+
+    kcheck(thread_convert_thread_state(*threads, THREAD_CONVERT_THREAD_STATE_FROM_SELF, X_THREAD_STATE, reinterpret_cast<thread_state_t>(&state), count, reinterpret_cast<thread_state_t>(&state), &count));
+    kcheck(thread_set_state(*threads, X_THREAD_STATE, reinterpret_cast<thread_state_t>(&state), count));
+
     insert_dylib(cur, library);
+
+    std::cout << "Injected " << libname << "!" << std::endl;
 }
 
 int main(int argc, char **argv) {
