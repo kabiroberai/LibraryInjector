@@ -153,31 +153,33 @@ public:
 // other dyld env var, dyld may use a cached launch closure and ignore
 // our new load command
 static std::uintptr_t rearrange_stack(TaskCursor &cur) {
+    /// https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/kern/kern_exec.c#L4919
+    ///
     /// initial stack layout (with dummy addresses):
     /// ...
-    /// 0x0FF0 <uninitialized>
-    /// 0x0FF8 <uninitialized>
+    /// 0xFFB8 <uninitialized>
+    /// 0xFFC0 <uninitialized>
     /// --- _dyld_start frame vvv ---
-    /// 0x1000 (cursor) load_address
-    /// 0x1008 argc
-    /// 0x1010 argv[]
-    /// 0x1018 envp[]
-    /// 0x1020 apple[]
-    /// 0x1028 strings
-    /// --- other frames below... ---
-
+    /// 0xFFC8 (cursor) load_address
+    /// 0xFFD0 argc
+    /// 0xFFD8 argv[]
+    /// 0xFFE0 envp[]
+    /// 0xFFE8 apple[]
+    /// 0xFFF0 strings
+    /// --- start of stack ---
+    ///
     /// final stack layout (with dummy addresses, slightly simplified):
     /// ...
-    /// 0x0FF0 <uninitialized>
+    /// 0xFFB8 <uninitialized>
     /// --- _dyld_start frame vvv ---
-    /// 0x0FF8 (cursor) load_address
-    /// 0x1000 argc
-    /// 0x1008 argv[]     -|
-    /// 0x1010 envp[]      | - rebased
-    /// 0x1018 apple[]    -|
-    /// 0x1020 strings
-    /// 0x1028 "DYLD_INSERT_LIBRARIES="
-    /// --- other frames below... ---
+    /// 0xFFC0 (cursor) load_address
+    /// 0xFFC8 argc
+    /// 0xFFD0 argv[]     -|
+    /// 0xFFD8 envp[]      | - rebased
+    /// 0xFFE0 apple[]    -|
+    /// 0xFFE8 strings
+    /// 0xFFF0 "DYLD_INSERT_LIBRARIES="
+    /// --- start of stack ---
 
     std::cout << "Rearranging... SP: " << (void *)cur.address() << std::endl;
 
