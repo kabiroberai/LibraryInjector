@@ -62,6 +62,14 @@ static constexpr inline T align(T orig) {
 // static_assert(align<8>(16) == 16);
 // static_assert(align<8>(17) == 24);
 
+template <typename T, typename U>
+static constexpr inline T round_down(T orig, U boundary) {
+    return orig / boundary * boundary;
+}
+//static_assert(round_down(8, 7) == 7);
+//static_assert(round_down(12, 7) == 7);
+//static_assert(round_down(14, 7) == 14);
+
 class TaskCursor {
 private:
     const task_t task_;
@@ -75,7 +83,7 @@ public:
     void write(const void *val, unsigned int val_size) {
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t info_sz = sizeof(info);
-        vm_address_t region_addr = address_ / PAGE_SIZE * PAGE_SIZE;
+        vm_address_t region_addr = round_down(address_, PAGE_SIZE);
         vm_size_t region_size;
         mach_port_t object; // unused
         kcheck(vm_region_64(task_, &region_addr, &region_size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_64_t>(&info), &info_sz, &object));
@@ -231,7 +239,7 @@ static std::uintptr_t rearrange_stack(TaskCursor &cur) {
 
     // it's okay if this overwrites the arguments on the stack since we've saved them
     // locally, and intend to write rebased versions onto the stack later
-    const auto stringsTop = (cur.address() - strings.size()) / sizeof(std::uintptr_t) * sizeof(std::uintptr_t);
+    const auto stringsTop = round_down(cur.address() - strings.size(), sizeof(std::uintptr_t));
     cur.address() = stringsTop;
     cur.write(strings.data(), (unsigned int)strings.size());
     cur.address() = stringsTop;
