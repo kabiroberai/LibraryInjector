@@ -80,7 +80,8 @@ public:
     const task_t &task() { return task_; }
     std::uintptr_t &address() { return address_; }
 
-    void write(const void *val, unsigned int val_size) {
+    // write next val_size bytes without moving cursor
+    void write_ahead(const void *val, unsigned int val_size) const {
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t info_sz = sizeof(info);
         vm_address_t region_addr = round_down(address_, PAGE_SIZE);
@@ -90,7 +91,16 @@ public:
         kcheck(vm_protect(task_, region_addr, region_size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY));
         kcheck(vm_write(task_, address_, reinterpret_cast<vm_offset_t>(val), val_size));
         kcheck(vm_protect(task_, region_addr, region_size, false, info.protection));
+    }
+
+    void write(const void *val, unsigned int val_size) {
+        write_ahead(val, val_size);
         address_ += val_size;
+    }
+
+    template <typename T>
+    void write_ahead(const T &val) const {
+        write_ahead(&val, sizeof(val));
     }
 
     template <typename T>
@@ -98,13 +108,13 @@ public:
         write(&val, sizeof(val));
     }
 
-    void peek(void *out, size_t size) {
+    void peek(void *out, size_t size) const {
         size_t count;
         kcheck(vm_read_overwrite(task_, address_, size, reinterpret_cast<vm_address_t>(out), &count));
         ensureEq(count, size);
     }
 
-    std::unique_ptr<char[]> peek(size_t size) {
+    std::unique_ptr<char[]> peek(size_t size) const {
         auto ptr = std::make_unique<char[]>(size);
         peek(ptr.get(), size);
         return ptr;
@@ -122,7 +132,7 @@ public:
     }
 
     template <typename T>
-    T peek() {
+    T peek() const {
         T t;
         peek(&t, sizeof(t));
         return t;
@@ -159,7 +169,8 @@ public:
 //
 // This function is needed because without DYLD_INSERT_LIBRARIES or some
 // other dyld env var, dyld may use a cached launch closure and ignore
-// our new load command
+// our new load command. We're good as long as we have a relevant dyld
+// env var, even if it's empty and/or ignored by dyld.
 static std::uintptr_t rearrange_stack(TaskCursor &cur) {
     /// https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/kern/kern_exec.c#L4919
     ///
@@ -206,29 +217,31 @@ static std::uintptr_t rearrange_stack(TaskCursor &cur) {
         cur.address() = oldAddr;
         return str;
     };
-    auto argv = std::vector<std::string>{};
+    std::vector<std::string> argv;
     std::transform(argvAddresses.begin(), argvAddresses.end(), std::back_inserter(argv), stringReader);
-    auto envp = std::vector<std::string>{};
+    std::vector<std::string> envp;
     std::transform(envpAddresses.begin(), envpAddresses.end(), std::back_inserter(envp), stringReader);
-    auto apple = std::vector<std::string>{};
+    std::vector<std::string> apple;
     std::transform(appleAddresses.begin(), appleAddresses.end(), std::back_inserter(apple), stringReader);
 
-    auto dyld_insert_libraries = std::find_if(envp.begin(), envp.end(), [](const auto &string) {
+    auto dyld_insert_libraries = std::find_if(envp.begin(), envp.end(), [&](const auto &string) {
         return string.starts_with("DYLD_INSERT_LIBRARIES=");
     });
     // if envp already has a DYLD_INSERT_LIBRARIES, no need to do anything
     if (dyld_insert_libraries == envp.end()) {
-        auto variable = "DYLD_INSERT_LIBRARIES=";
-        envp.push_back(variable);
+        // we don't actually insert the library this way; we just need
+        // to ensure this env var exists so that dyld discards its
+        // closure.
+        envp.push_back("DYLD_INSERT_LIBRARIES=");
     }
 
     argvAddresses.clear();
     envpAddresses.clear();
     appleAddresses.clear();
 
-    auto strings = std::vector<char>{};
+    std::vector<char> strings;
 
-    auto arrayGenerator = [&strings](auto &addresses, const auto &string) {
+    auto arrayGenerator = [&](auto &addresses, const auto &string) {
         addresses.push_back(strings.size());
         std::copy(string.begin(), string.end(), std::back_inserter(strings));
         strings.push_back('\0');
@@ -239,10 +252,8 @@ static std::uintptr_t rearrange_stack(TaskCursor &cur) {
 
     // it's okay if this overwrites the arguments on the stack since we've saved them
     // locally, and intend to write rebased versions onto the stack later
-    const auto stringsTop = round_down(cur.address() - strings.size(), sizeof(std::uintptr_t));
-    cur.address() = stringsTop;
-    cur.write(strings.data(), (unsigned int)strings.size());
-    cur.address() = stringsTop;
+    cur.address() = round_down(cur.address() - strings.size(), sizeof(std::uintptr_t));
+    cur.write_ahead(strings.data(), (unsigned int)strings.size());
 
     auto rebaser = [&](auto &&address) {
         address += cur.address();
@@ -251,7 +262,8 @@ static std::uintptr_t rearrange_stack(TaskCursor &cur) {
     std::for_each(envpAddresses.begin(), envpAddresses.end(), rebaser);
     std::for_each(appleAddresses.begin(), appleAddresses.end(), rebaser);
 
-    auto addresses = std::vector<std::uintptr_t>{};
+    std::vector<std::uintptr_t> addresses;
+    addresses.reserve(argvAddresses.size() + 1 + envpAddresses.size() + 1 + appleAddresses.size() + 1);
     std::copy(argvAddresses.begin(), argvAddresses.end(), std::back_inserter(addresses));
     addresses.push_back(0);
     std::copy(envpAddresses.begin(), envpAddresses.end(), std::back_inserter(addresses));
