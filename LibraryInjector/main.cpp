@@ -383,7 +383,11 @@ int main(int argc, char **argv) {
                 const char *name = message->event.exec.target->executable->path.data;
                 if (fs::equivalent(name, process)) {
                     pid_t pid = audit_token_to_pid(message->process->audit_token);
-                    inject(pid, library);
+                    try {
+                        inject(pid, library);
+                    } catch (const std::exception &e) {
+                        std::cerr << "error: Failed to inject: " << e.what() << std::endl;
+                    }
                 }
                 es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
                 break;
